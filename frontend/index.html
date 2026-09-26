@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>演奏录音与乐谱偏差复盘台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>演奏录音与乐谱偏差复盘台</h1>
+  <div class="hint">单声部 MusicXML + WAV → 反复展开 · 基频/起音提取 · 单调 DP 对齐 · 错音/漏音/多音/起音/时值复盘</div>
+  <nav id="view-tabs">
+    <button id="tab-review" class="tab active">单次复盘</button>
+    <button id="tab-compare" class="tab">多次演奏对比</button>
+    <button id="tab-rx" class="tab">偏差练习处方</button>
+    <button id="tab-practice" class="tab">偏差片段练习谱</button>
+    <button id="tab-revision" class="tab">谱面修订迁移</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 左侧栏 -->
+  <aside>
+    <section id="upload-section">
+      <h2>① 上传素材</h2>
+      <form id="upload-form">
+        <label>标题<input type="text" id="title" required placeholder="例：月光 第1段 第3次"></label>
+        <label>MusicXML（单声部）
+          <input type="file" id="musicxml" accept=".xml,.musicxml,.mxl" required></label>
+        <label>WAV 录音
+          <input type="file" id="audio" accept=".wav" required></label>
+        <button type="submit">上传并分析</button>
+        <div id="upload-status" class="status-msg"></div>
+      </form>
+    </section>
+
+    <section id="list-section">
+      <h2>② 乐曲列表</h2>
+      <ul id="piece-list"></ul>
+    </section>
+
+    <section id="anchors-panel" class="hidden">
+      <h2>锚点</h2>
+      <ul id="anchor-list"></ul>
+    </section>
+
+    <section id="pending-panel" class="hidden">
+      <h2>待确认片段（不强配）</h2>
+      <ul id="pending-list"></ul>
+    </section>
+
+    <section id="compare-side-panel" class="hidden">
+      <h2>③ 演奏对比</h2>
+      <button id="btn-new-compare">＋ 新建对比（2–6 次同曲录音）</button>
+      <ul id="comparison-list"></ul>
+    </section>
+
+    <section id="rx-side-panel" class="hidden">
+      <h2>④ 偏差练习处方</h2>
+      <button id="btn-new-rx-piece">＋ 从已分析乐曲建处方</button>
+      <button id="btn-new-rx-cmp">＋ 从未过期对比建处方</button>
+      <ul id="rx-list"></ul>
+    </section>
+
+    <section id="practice-side-panel" class="hidden">
+      <h2>⑤ 偏差片段练习谱</h2>
+      <button id="btn-new-practice">＋ 从当前复盘框选片段</button>
+      <ul id="practice-list"></ul>
+    </section>
+
+    <section id="revision-side-panel" class="hidden">
+      <h2>⑥ 谱面修订迁移</h2>
+      <button id="btn-new-revision">＋ 从当前复盘上传修订谱</button>
+      <ul id="revision-list"></ul>
+    </section>
+  </aside>
+
+  <!-- 右侧复盘区 -->
+  <section id="review" class="hidden">
+    <div id="review-head">
+      <div id="piece-title"></div>
+      <div id="stats" class="stats"></div>
+      <div class="actions">
+        <button id="btn-review-rx" title="从当前已分析乐曲框选谱段建处方">
+          ＋ 用此乐曲开处方</button>
+        <button id="btn-review-practice"
+          title="按展开后的小节与反复轮次框选连续片段，生成练习谱">
+          ＋ 生成偏差片段练习谱</button>
+        <button id="btn-review-revision"
+          title="上传修订版单声部 MusicXML，确定性匹配并预览历史产物迁移">
+          ＋ 谱面修订迁移</button>
+        <button id="btn-export">导出确定性 JSON</button>
+        <span id="cache-info" class="cache-info"></span>
+      </div>
+    </div>
+
+    <div id="warnings" class="warnings"></div>
+
+    <div id="transport">
+      <button id="btn-play">▶ 播放</button>
+      <span id="time-readout">0.00s</span>
+      <span class="transport-hint">点击任意轨道定位 · 选中乐谱音+观测音后可锁定配对 / 排除</span>
+      <span id="legend" class="legend">
+        <i style="background:var(--correct)"></i>正确
+        <i style="background:var(--wrong)"></i>错音
+        <i style="background:var(--missing)"></i>漏音
+        <i style="background:var(--extra)"></i>多音
+        <i style="background:var(--onset)"></i>起音偏移
+        <i style="background:var(--duration)"></i>时值偏差
+        <i style="background:var(--pending)"></i>待确认
+        <i style="background:var(--excluded)"></i>排除/无声
+      </span>
+    </div>
+
+    <div id="tracks-scroll">
+      <svg id="tracks"></svg>
+    </div>
+
+    <div id="selection-bar" class="selection-bar hidden">
+      <span id="selection-info"></span>
+      <button id="btn-lock">🔒 锁定配对</button>
+      <button id="btn-exclude-score">排除乐谱音</button>
+      <button id="btn-exclude-obs">排除观测音</button>
+      <button id="btn-clear-sel">取消选择</button>
+    </div>
+
+    <div id="detail" class="detail">
+      <em>点击谱块或观测块查看判定依据（basis）。</em>
+    </div>
+  </section>
+
+  <!-- 右侧多次演奏对比区 -->
+  <section id="compare-view" class="hidden">
+    <div id="compare-empty" class="detail">
+      从左侧“演奏对比”面板选择一次已有对比，或点击
+      <b>＋ 新建对比</b>：选择 2–6 次<b>同曲</b>已完成复盘的录音并指定基线。
+      系统按展开音符序列 + 原谱坐标生成乐谱指纹，自动拒绝不可比录音。<br><br>
+      判定规则：基线异常→目标正常为 <span class="v-resolved">已解决</span>；
+      基线正常→目标异常为 <span class="v-new">新出现（回退）</span>；
+      两侧均异常为 <span class="v-persistent">持续</span>；
+      任一侧待确认 / 用户排除 / 置信度低于阈值为
+      <span class="v-incomparable">不可比</span>。
+    </div>
+
+    <div id="compare-builder" class="hidden">
+      <div id="builder-head">
+        <div class="builder-title">新建多次演奏对比</div>
+        <div class="actions">
+          <button id="btn-create-confirm">创建对比</button>
+          <button id="btn-create-cancel">取消</button>
+        </div>
+      </div>
+      <div id="builder-hint" class="transport-hint">
+        勾选 2–6 次同曲录音，再用单选指定其中一次为基线。
+      </div>
+      <ul id="builder-list"></ul>
+    </div>
+
+    <div id="compare-detail" class="hidden">
+      <div id="compare-head">
+        <div>
+          <div id="compare-title"></div>
+          <div id="compare-meta" class="transport-hint"></div>
+        </div>
+        <div class="actions">
+          <span id="compare-stale-banner" class="stale-banner hidden"></span>
+          <button id="btn-compare-rx" title="按当前只读快照的基线谱面框选谱段">
+            ＋ 用此对比赛处方</button>
+          <button id="btn-compare-refresh">↻ 显式刷新（固化最新对齐）</button>
+          <button id="btn-compare-delete">删除对比</button>
+        </div>
+      </div>
+
+      <div id="compare-members"></div>
+
+      <div id="compare-toolbar">
+        <label class="measure-filter">小节筛选
+          <select id="measure-select"><option value="">全部小节</option></select>
+        </label>
+        <span class="transport-hint">点击矩阵单元格 → 各录音同步定位到同一谱音；
+          ▶ 同时播放可对照。</span>
+        <div class="compare-legend">
+          <i class="v-resolved"></i>已解决
+          <i class="v-new"></i>新出现/回退
+          <i class="v-persistent"></i>持续
+          <i class="v-incomparable"></i>不可比
+          <i class="v-normal"></i>均正常
+        </div>
+      </div>
+
+      <div id="matrix-scroll">
+        <table id="matrix-table"></table>
+      </div>
+
+      <div id="compare-segments"></div>
+
+      <div id="synth-panel">
+        <div id="synth-head">
+          <h2>最佳片段合成轨</h2>
+          <span id="synth-status" class="transport-hint"></span>
+        </div>
+        <div id="synth-actions" class="actions"></div>
+        <div id="synth-stale-banner" class="stale-banner hidden"></div>
+        <div id="synth-blocked" class="synth-blocked hidden"></div>
+        <div id="synth-cost" class="synth-cost"></div>
+        <div id="synth-weights" class="synth-weights"></div>
+        <div id="synth-segments" class="synth-segments"></div>
+        <div id="synth-cuts" class="synth-cuts"></div>
+        <div id="synth-table-wrap" class="synth-table-wrap">
+          <table id="synth-table"></table>
+        </div>
+        <div id="synth-player" class="synth-player hidden">
+          <audio id="synth-audio" controls preload="none"></audio>
+          <a id="synth-download" class="dl-link" download>⬇ 下载 WAV</a>
+          <a id="synth-manifest" class="dl-link" download>⬇ 下载确定性清单 JSON</a>
+          <div id="synth-player-note" class="synth-note hidden"></div>
+        </div>
+      </div>
+
+      <div id="compare-transport">
+        <button id="btn-compare-play">▶ 同时播放</button>
+        <span id="compare-time" class="transport-hint"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右侧偏差练习处方区 -->
+  <section id="rx-view" class="hidden">
+    <div id="rx-empty" class="detail">
+      <b>偏差练习处方与复测</b><br><br>
+      从<b>已分析乐曲</b>或<b>未过期的多次演奏对比</b>中框选若干<b>连续谱段</b>，
+      为每段声明必须消除的偏差类别、允许的最大起音/时值误差、最多异常音数，
+      以及是否禁止待确认；创建时把<b>乐谱指纹、对齐版本与规则整体固化为只读
+      处方</b>。<br>
+      之后可关联<b>同曲后续录音</b>复测：准入分两条独立校验——<b>来源固化
+      成员任一过期</b>（对齐版本/音频变化）须先<b>显式重绑</b>；<b>同曲新
+      录音无需重绑</b>，只要有当前已确认对齐版本即可复测，复测当场固化该
+      目标对齐版本与音频哈希。谱指纹不同、或目标没有已确认对齐时一律拒绝；
+      系统按处方谱段重新计算
+      <span class="rx-pass">通过</span> / <span class="rx-fail">未通过</span>
+      / <span class="rx-und">不可判定</span>，逐项给出实际值、阈值、证据音符
+      与失败原因。历史复测只读，来源或目标之后变化不改写旧结果。<br><br>
+      从左侧选择一张处方查看时间线与复测差异，或点击上方按钮新建。
+    </div>
+
+    <div id="rx-builder" class="hidden">
+      <div id="rx-builder-head">
+        <div class="builder-title">新建偏差练习处方</div>
+        <div class="actions">
+          <button id="btn-rx-create">固化为只读处方</button>
+          <button id="btn-rx-cancel">取消</button>
+        </div>
+      </div>
+      <div id="rx-builder-source" class="transport-hint"></div>
+      <label class="rx-title-input">处方标题（可留空）
+        <input type="text" id="rx-title" placeholder="例：第 5–8 小节 起音专项"></label>
+      <div id="rx-builder-hint" class="transport-hint">
+        用起点/终点谱音下标框选连续谱段（按下标升序、不得重叠），
+        再为每段设置规则；或在下方谱面条上点击设置当前段的起点/终点。
+      </div>
+      <div id="rx-seg-editor"></div>
+      <div id="rx-note-strip-wrap" class="rx-note-strip-wrap hidden">
+        <div class="transport-hint">展开谱面（颜色为基线当前判定；点击谱音设为
+          “当前编辑段”的起点/终点）</div>
+        <div id="rx-note-strip"></div>
+      </div>
+    </div>
+
+    <div id="rx-detail" class="hidden">
+      <div id="rx-head">
+        <div>
+          <div id="rx-detail-title"></div>
+          <div id="rx-detail-meta" class="transport-hint"></div>
+        </div>
+        <div class="actions">
+          <span id="rx-stale-banner" class="stale-banner hidden"></span>
+          <button id="btn-rx-rebind">🔗 显式重绑来源</button>
+          <button id="btn-rx-void">作废处方</button>
+        </div>
+      </div>
+
+      <div id="rx-frozen" class="rx-frozen"></div>
+
+      <div id="rx-current-overall" class="rx-current-overall"></div>
+
+      <div id="rx-retest-bar" class="rx-retest-bar">
+        <label>关联同曲录音复测
+          <select id="rx-target-select"></select>
+        </label>
+        <button id="btn-rx-retest">▶ 提交复测（幂等）</button>
+        <span id="rx-retest-msg" class="transport-hint"></span>
+      </div>
+
+      <div id="rx-segments-rules"></div>
+
+      <div class="rx-cols">
+        <div>
+          <h3 class="rx-h3">复测时间线</h3>
+          <ul id="rx-timeline" class="rx-timeline"></ul>
+        </div>
+        <div>
+          <h3 class="rx-h3">复测差异</h3>
+          <div id="rx-diff-controls" class="transport-hint"></div>
+          <div id="rx-diff" class="rx-diff"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右侧偏差片段练习谱区 -->
+  <section id="practice-view" class="hidden">
+    <div id="practice-empty" class="detail">
+      <b>偏差片段练习谱</b><br><br>
+      在<b>单次复盘</b>中，按展开后的<b>整小节（含反复记号展开后的演奏轮次）</b>
+      框选若干<b>连续片段</b>，为每段设置<b>循环次数、起始速度（BPM）与逐轮增速</b>。
+      每段必须包含<b>已确认的偏差音</b>；<b>待确认、已排除或低于置信阈值</b>的谱位会
+      <span class="rx-fail">逐位提示并阻止生成</span>。<br>
+      系统从原 MusicXML 提取对应演奏轮次的<b>整小节</b>，保留音高、时值、休止、
+      拍号、调号与片段内连音，按选定顺序逐轮展开；<b>跨片段连音在边界截断并逐处标记，
+      绝不留下悬空连音</b>，每轮开头注明原谱坐标与速度。<br>
+      下载的 MusicXML 内嵌<b>来源谱哈希、对齐版本与生成参数</b>；之后来源变化
+      <b>只把对应版本标记过期、全部历史稿仍可下载</b>。每次成功生成（创建 /
+      显式重建）都分配<b>独立版本</b>并保留固化清单，任务始终指向明确的
+      <b>当前版本</b>；可在“版本历史”中查看并下载任一旧版本。重建失败
+      <b>不新增、不改写任何版本</b>。<br><br>
+      请先在“单次复盘”页打开一支已分析的录音，再点
+      <b>＋ 生成偏差片段练习谱</b>，或从左侧选择已有练习谱。
+    </div>
+
+    <div id="practice-builder" class="hidden">
+      <div id="practice-builder-head">
+        <div class="builder-title">新建偏差片段练习谱</div>
+        <div class="actions">
+          <button id="btn-practice-create">生成并固化练习谱</button>
+          <button id="btn-practice-cancel">取消</button>
+        </div>
+      </div>
+      <div id="practice-builder-source" class="transport-hint"></div>
+      <label class="rx-title-input">练习谱标题（可留空）
+        <input type="text" id="practice-title"
+               placeholder="例：第 3–6 小节 错音专项"></label>
+      <div id="practice-block-banner" class="synth-blocked hidden"></div>
+      <div id="practice-seg-editor"></div>
+      <div id="practice-measure-strip-wrap" class="rx-note-strip-wrap hidden">
+        <div class="transport-hint">展开后的小节（含反复轮次）：点击小节设为
+          “当前编辑片段”的起/止小节；带 <span class="pr-badge dev">偏差</span>
+          标记的小节含已确认偏差音；带 <span class="pr-badge blk">阻止</span>
+          标记的小节含待确认/已排除/低置信谱位。</div>
+        <div id="practice-measure-strip"></div>
+      </div>
+    </div>
+
+    <div id="practice-detail" class="hidden">
+      <div id="practice-detail-head">
+        <div>
+          <div id="practice-detail-title"></div>
+          <div id="practice-detail-meta" class="transport-hint"></div>
+        </div>
+        <div class="actions">
+          <span id="practice-stale-banner" class="stale-banner hidden"></span>
+          <button id="btn-practice-rebuild">↻ 显式重建（校验通过后追加新版本）</button>
+          <button id="btn-practice-delete">删除练习谱</button>
+        </div>
+      </div>
+
+      <div id="practice-frozen" class="rx-frozen"></div>
+      <div id="practice-rebuild-msg" class="status-msg"></div>
+
+      <h3 class="rx-h3">练习顺序（按片段 × 循环轮展开）</h3>
+      <div id="practice-order" class="practice-order"></div>
+
+      <h3 class="rx-h3">版本历史（每次成功生成一个只读版本，可下载任一版本）</h3>
+      <div id="practice-versions" class="practice-versions"></div>
+
+      <h3 class="rx-h3">片段参数与截断标记</h3>
+      <div id="practice-segments" class="practice-segments"></div>
+
+      <div id="practice-downloads" class="synth-player">
+        <a id="practice-download-xml" class="dl-link" download>
+          ⬇ 下载练习谱 MusicXML</a>
+        <a id="practice-download-manifest" class="dl-link" download>
+          ⬇ 下载确定性清单 JSON</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右侧谱面修订迁移区 -->
+  <section id="revision-view" class="hidden">
+    <div id="revision-empty" class="detail">
+      <b>谱面修订迁移</b><br><br>
+      选择一条<b>已分析录音</b>及其当前 MusicXML，上传一份<b>修订版单声部
+      MusicXML</b>。系统对两侧谱面展开反复后，按
+      <b>（原谱小节、反复轮次、拍位、音高、时值）</b>做确定性匹配，逐谱位区分为
+      <span class="rv-kept">保留</span> / <span class="rv-moved">移动</span> /
+      <span class="rv-modified">修改</span> / <span class="rx-fail">删除</span> /
+      <span class="rx-pass">新增</span> / <span class="rv-unmatched">无法匹配</span>。<br>
+      基于匹配结果，把<b>锚点、对齐快照、未过期对比、处方与练习谱片段</b>逐项标为
+      <span class="rx-pass">可继承</span> / <span class="rx-und">需复核</span> /
+      <span class="rx-fail">失效</span>并说明原因；<b>禁止静默改写历史</b>。
+      匹配冲突或多声部歧义会阻止提交。确认后创建新的谱面修订记录与
+      <b>供后续录音使用的复盘入口</b>（旧记录只读、可下载），报告可导出
+      <b>确定性 JSON</b>。<br><br>
+      请先在“单次复盘”页打开一支已分析录音，再点 <b>＋ 谱面修订迁移</b>。
+    </div>
+
+    <div id="revision-detail" class="hidden">
+      <div id="revision-head">
+        <div>
+          <div id="revision-detail-title"></div>
+          <div id="revision-detail-meta" class="transport-hint"></div>
+        </div>
+        <div class="actions">
+          <a id="revision-download-xml" class="dl-link" download>
+            ⬇ 修订版 MusicXML</a>
+          <a id="revision-download-report" class="dl-link" download>
+            ⬇ 确定性迁移报告 JSON</a>
+          <button id="btn-revision-delete">放弃预览</button>
+        </div>
+      </div>
+
+      <div id="revision-blockers" class="synth-blocked hidden"></div>
+      <div id="revision-summary" class="rx-frozen"></div>
+
+      <div id="revision-commit-bar" class="rx-retest-bar hidden">
+        <label>确认提交（request_id 幂等）
+          <input type="text" id="revision-request-id"
+                 placeholder="自动生成，可留空"></label>
+        <button id="btn-revision-commit">✓ 确认迁移：创建新复盘入口</button>
+        <span id="revision-commit-msg" class="transport-hint"></span>
+      </div>
+
+      <div id="revision-newentry" class="rx-current-overall hidden"></div>
+      <div id="revision-audio-bar" class="rx-retest-bar hidden">
+        <label>为修订后谱面上传后续录音（WAV）
+          <input type="file" id="revision-audio-file" accept=".wav"></label>
+        <button id="btn-revision-audio">⬆ 上传并后台分析</button>
+        <span id="revision-audio-msg" class="transport-hint"></span>
+      </div>
+      <div id="revision-carryover" class="practice-versions"></div>
+
+      <h3 class="rx-h3">逐谱位匹配（展开反复后，确定性）</h3>
+      <div class="transport-hint">
+        图例：<span class="rv-kept">保留</span>（谱位+内容一致）·
+        <span class="rv-moved">移动</span>（同内容换谱位）·
+        <span class="rv-modified">修改</span>（同谱位改音高/时值）·
+        <span class="rx-fail">删除</span> · <span class="rx-pass">新增</span> ·
+        <span class="rv-unmatched">无法匹配</span>
+      </div>
+      <div id="revision-matrix-wrap" class="synth-table-wrap">
+        <table id="revision-matrix"></table>
+      </div>
+
+      <h3 class="rx-h3">历史产物逐项继承判定</h3>
+      <div id="revision-impact" class="rx-cols"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+<script src="/compare.js"></script>
+<script src="/synth.js"></script>
+<script src="/rx.js"></script>
+<script src="/practice.js"></script>
+<script src="/revision.js"></script>
+</body>
+</html>

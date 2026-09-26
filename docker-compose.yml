@@ -1,0 +1,10 @@
+services:
+  review-desk:
+    build: .
+    image: score-audio-review:latest
+    container_name: score-audio-review
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

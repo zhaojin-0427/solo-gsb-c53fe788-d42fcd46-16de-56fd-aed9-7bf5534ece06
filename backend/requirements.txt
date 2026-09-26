@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+music21==9.1.0
+librosa==0.10.2.post1
+numpy==1.26.4
+scipy==1.13.1
+numba==0.60.0
+soundfile==0.12.1
