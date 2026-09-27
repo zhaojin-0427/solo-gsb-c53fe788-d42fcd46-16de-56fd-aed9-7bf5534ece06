@@ -23,7 +23,11 @@ MusicXML。系统把两侧谱面都展开反复，按
 * ``unalignable_measure``：修订谱的展开小节单位无法对回旧谱（改小节号/
   结构重组），该单位内谱音一律不静默迁移；
 * ``ambiguous_move``：剩余谱音的保序对齐中存在等代价移动配对，移动对象
-  非唯一（DP 次优间隔为 0）。
+  非唯一（DP 次优间隔为 0）；
+* ``source_rescore_mismatch`` / ``source_score_unavailable``：预览与确认
+  都按**原谱重新解析**取得修正轮次后的坐标，再以稳定 ``score_index``
+  对应旧库 ``score_notes``（逐位核对音高/展开拍位/时值）；对应不可靠时
+  在预览中说明原因并阻止确认，绝不沿用旧库中可能错位的轮次坐标静默匹配。
 
 基于匹配结果生成**迁移预览**，把锚点、对齐快照、未过期对比、处方与
 练习谱片段逐项标为 ``inheritable`` 可继承 / ``review`` 需复核 /
@@ -70,6 +74,8 @@ BLK_DUP_POS = "duplicate_position"
 BLK_MISSING_COORD = "missing_coordinate"
 BLK_UNALIGNABLE = "unalignable_measure"
 BLK_AMBIG_MOVE = "ambiguous_move"
+BLK_RESCORE_MISMATCH = "source_rescore_mismatch"
+BLK_SOURCE_UNAVAILABLE = "source_score_unavailable"
 
 MATCH_LABELS_ZH = {
     MATCH_KEPT: "保留", MATCH_MODIFIED: "修改", MATCH_MOVED: "移动",
@@ -216,33 +222,6 @@ def _units_of(notes):
                       "beat_start": beat_of[idxs[0]]})
     units.sort(key=lambda u: (u["beat_start"], u["key"][0], u["key"][1]))
     return units
-
-
-def _lcs_pairs(old_keys, new_keys):
-    """两列单位键的最长公共子序列配对（保序、确定性）。
-
-    返回 matched: [(old_pos, new_pos), ...]（按旧序列升序）。
-    """
-    n, m = len(old_keys), len(new_keys)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        for j in range(m - 1, -1, -1):
-            if old_keys[i] == new_keys[j]:
-                dp[i][j] = dp[i + 1][j + 1] + 1
-            else:
-                dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
-    pairs = []
-    i = j = 0
-    while i < n and j < m:
-        if old_keys[i] == new_keys[j]:
-            pairs.append((i, j))
-            i += 1
-            j += 1
-        elif dp[i + 1][j] >= dp[i][j + 1]:
-            i += 1
-        else:
-            j += 1
-    return pairs
 
 
 def _note_coord(note):
@@ -532,6 +511,77 @@ def _q(v):
     return f"{round(float(v), C.ROUND_NDIGITS):g}"
 
 
+# ============================================================ 源谱坐标重取
+
+def _load_db_notes(piece_id: str) -> list[dict]:
+    """旧库 score_notes（只读快照，绝不改写）。"""
+    return [{"index": r["idx"], "midi": float(r["midi"]),
+             "beat": float(r["beat"]), "dur_q": float(r["dur_q"]),
+             "measure": r["measure"],
+             "beat_in_measure": r["beat_in_measure"],
+             "occurrence": r["occurrence"], "part": r["part"]}
+            for r in db.get_score_notes(piece_id)]
+
+
+def _rescore_source(piece: dict, db_notes: list[dict]):
+    """按原谱重新解析取得修正轮次后的坐标，与旧库谱音按稳定下标对应。
+
+    旧库 ``score_notes`` 是录音分析时固化的（只读，不改写）：其中反复
+    轮次可能来自旧版逐音递增的错误计数。迁移一律改用**当场重新解析
+    源 MusicXML** 得到的坐标（轮次按展开后的小节实例计数），并以
+    稳定 ``score_index``（展开顺序下标）逐位对应旧库记录——音高、
+    展开拍位、时值必须一致（浮点容差内），否则视为无法可靠对应。
+
+    返回 (old_notes, blockers)：可靠时 old_notes 为重新解析的谱音
+    （下标与旧库一致），blockers 为空；不可靠时 old_notes 为 None，
+    blockers 逐项说明原因（预览展示并阻止确认）。
+    """
+    try:
+        fresh, _warnings = score_parser.parse_musicxml(
+            piece["musicxml_path"])
+    except Exception as exc:  # noqa: BLE001
+        return None, [{
+            "reason": BLK_SOURCE_UNAVAILABLE,
+            "detail": f"无法重新解析源 MusicXML 取得修正轮次坐标：{exc}",
+        }]
+    for i, n in enumerate(fresh):
+        n["index"] = i
+
+    if len(fresh) != len(db_notes):
+        return None, [{
+            "reason": BLK_RESCORE_MISMATCH,
+            "old_note_count": len(db_notes),
+            "reparsed_note_count": len(fresh),
+            "detail": f"源谱重新解析得到 {len(fresh)} 个谱音，旧库记录 "
+                      f"{len(db_notes)} 个，数量不一致，无法按稳定下标对应",
+        }]
+
+    blockers = []
+    for i, (fn, dn) in enumerate(zip(fresh, db_notes)):
+        diffs = []
+        if abs(float(fn["midi"]) - float(dn["midi"])) >= 0.5:
+            diffs.append(f"音高 {_midi_name(dn['midi'])}≠"
+                         f"{_midi_name(fn['midi'])}")
+        if abs(float(fn["beat"]) - float(dn["beat"])) > 1e-4:
+            diffs.append(f"展开拍位 {_q(dn['beat'])}≠{_q(fn['beat'])}")
+        if abs(float(fn["dur_q"]) - float(dn["dur_q"])) \
+                >= C.REVISION_DUR_EPS:
+            diffs.append(f"时值 {_q(dn['dur_q'])}≠{_q(fn['dur_q'])}")
+        if diffs:
+            blockers.append({
+                "reason": BLK_RESCORE_MISMATCH, "score_index": i,
+                "measure": dn.get("measure"),
+                "occurrence": dn.get("occurrence", 0),
+                "detail": f"谱音 #{i} 重新解析与旧库记录不一致"
+                          f"（{'，'.join(diffs)}），无法可靠对应",
+            })
+            if len(blockers) >= 5:  # 确定性截断：只列前 5 处
+                break
+    if blockers:
+        return None, blockers
+    return fresh, []
+
+
 # ============================================================ 迁移预览
 
 def build_preview(piece_id: str, revised_bytes: bytes,
@@ -546,13 +596,11 @@ def build_preview(piece_id: str, revised_bytes: bytes,
     if not align:
         raise ValueError("该录音尚无已确认对齐版本")
 
-    old_rows = db.get_score_notes(piece_id)
-    old_notes = [{"index": r["idx"], "midi": float(r["midi"]),
-                  "beat": float(r["beat"]), "dur_q": float(r["dur_q"]),
-                  "measure": r["measure"],
-                  "beat_in_measure": r["beat_in_measure"],
-                  "occurrence": r["occurrence"], "part": r["part"]}
-                 for r in old_rows]
+    db_notes = _load_db_notes(piece_id)
+
+    # 预览按原谱**重新解析**取得修正轮次后的坐标，再以稳定 score_index
+    # 对应旧库 score_notes；无法可靠对应时预览说明原因并阻止确认。
+    old_notes, rescore_blockers = _rescore_source(piece, db_notes)
 
     new_notes, parse_warnings, revised_hash = parse_revision(
         revised_bytes)
@@ -560,10 +608,19 @@ def build_preview(piece_id: str, revised_bytes: bytes,
     for i, n in enumerate(new_notes):
         n["index"] = i
 
-    matches, blockers = match_scores(old_notes, new_notes)
+    if rescore_blockers:
+        matches, blockers = [], list(rescore_blockers)
+        degraded_reason = (
+            "源谱重新解析后无法与旧库谱音按稳定下标可靠对应"
+            "（详见阻止项），继承状态无法判定，迁移已阻止")
+    else:
+        matches, blockers = match_scores(old_notes, new_notes)
+        degraded_reason = None
 
     old_to_new = _old_new_index_map(matches)
-    impact = build_impact(piece_id, matches, old_to_new)
+    impact = build_impact(piece_id, matches, old_to_new,
+                          db_old_notes=db_notes,
+                          degraded_reason=degraded_reason)
 
     source_hash = file_sha256(piece["musicxml_path"])
     # 每条匹配记录只计一次（kept/modified/moved 是成对记录，deleted 只挂旧
@@ -586,7 +643,7 @@ def build_preview(piece_id: str, revised_bytes: bytes,
         "can_commit": not blockers,
         "blockers": blockers,
         "summary": {
-            "old_note_count": len(old_notes),
+            "old_note_count": len(db_notes),
             "new_note_count": len(new_notes),
             **counts,
             "blocker_count": len(blockers),
@@ -637,15 +694,26 @@ def _position_status(kind):
     return INVALID  # deleted / unmatched
 
 
-def build_impact(piece_id, matches, old_to_new_map):
-    """逐项标注锚点 / 对齐快照 / 未过期对比 / 处方 / 练习谱。"""
+def build_impact(piece_id, matches, old_to_new_map, db_old_notes=None,
+                 degraded_reason=None):
+    """逐项标注锚点 / 对齐快照 / 未过期对比 / 处方 / 练习谱。
+
+    db_old_notes：旧库 score_notes 原样（只读）。练习谱片段的展开单位
+    位置（order_start/order_end）以**创建时同一份旧库数据**解析，
+    旧下标引用不漂移；单位到修订谱的映射一律经稳定 score_index 完成。
+    degraded_reason：源谱重取坐标不可靠时，所有对象统一标失效并给出
+    该原因（预览已阻止确认，不做任何继承）。
+    """
     kind_by_old = {m["old"]["score_index"]: m["kind"]
                    for m in matches if m.get("old")}
     new_by_old = {e["old_index"]: (e["new_index"], e["kind"])
                   for e in old_to_new_map}
-    # 旧/新展开单位位置 -> 匹配关系（供练习谱按整小节单位映射）
-    old_unit_pos, new_unit_pos = _unit_positions(matches)
-    unit_map = _map_units(old_unit_pos, new_unit_pos, matches)
+    # 新侧展开单位从匹配视图重建；旧侧单位一律用旧库原样数据（与练习谱
+    # 片段创建时的展开顺序一致），绝不改用重取坐标后的单位序列。
+    new_units = _unit_positions(matches)[1]
+    old_units_db = _units_of(db_old_notes) if db_old_notes is not None \
+        else _unit_positions(matches)[0]
+    unit_map = _map_units(old_units_db, new_units, matches, old_to_new_map)
     items: list[dict] = []
 
     # ---- 锚点 ----
@@ -796,6 +864,16 @@ def build_impact(piece_id, matches, old_to_new_map):
                 "mapped_segments": mapped,
             })
 
+    if degraded_reason is not None:
+        # 源谱重取坐标不可靠：继承状态无法判定，全部标失效并说明原因；
+        # 不预置锚点、不生成接续模板（预览已阻止确认）。
+        for it in items:
+            it["status"] = INVALID
+            it["reasons"] = [degraded_reason]
+        inherit_anchor_indexes = []
+        prx_templates = []
+        practice_templates = []
+
     groups = {}
     for it in items:
         groups.setdefault(it["artifact"], []).append(
@@ -886,6 +964,9 @@ def _map_practice_segment(seg, unit_map):
 
     单位消失 -> invalid；单位内有修改/移动谱音 -> review；映射后新单位
     不连续（中间被插入新单位）-> review。
+    多个旧单位折叠进同一新单位（旧库轮次计数把同一次演奏的小节拆成
+    多个单位，修正后合并为一个）不算不连续：先合并相邻重复的新单位
+    再做连续性检查。
     """
     a, b = seg.get("order_start"), seg.get("order_end")
     if a is None:
@@ -899,9 +980,16 @@ def _map_practice_segment(seg, unit_map):
         statuses.append(info["status"])
         entries.append(info)
     st = _worst(statuses)
-    new_keys = [[e["new_key"][0], e["new_key"][1]] for e in entries]
+    merged = []
+    for e in entries:
+        key = (e["new_key"][0], e["new_key"][1])
+        if merged and (merged[-1]["new_key"][0],
+                       merged[-1]["new_key"][1]) == key:
+            continue
+        merged.append(e)
+    new_keys = [[e["new_key"][0], e["new_key"][1]] for e in merged]
     if st == INHERIT:
-        nps = [e["new_key"][2] for e in entries]
+        nps = [e["new_key"][2] for e in merged]
         if any(nps[i + 1] != nps[i] + 1 for i in range(len(nps) - 1)):
             st = REVIEW
     return st, new_keys
@@ -932,26 +1020,43 @@ def _unit_positions(matches):
     return _collect("old"), _collect("new")
 
 
-def _map_units(old_units, new_units, matches):
-    """旧单位（按展开位置）-> 新单位 + 继承等级。
+def _map_units(old_units, new_units, matches, old_to_new_map):
+    """旧单位（旧库展开顺序位置）-> 新单位 + 继承等级。
 
-    沿用与主匹配相同的单位 LCS 配对（measure + occurrence）：
-    配对单位按其内谱位 worst 判定（保留可继承；修改/移动需复核）；
-    未对上旧单位 -> 无映射（invalid，片段含此单位即失效）。
+    旧侧单位序列来自**旧库 score_notes 原样数据**（与练习谱片段创建时
+    的展开顺序一致，order_start/order_end 不漂移）；单位到修订谱的映射
+    一律经**稳定 score_index**：单位内每个谱音按匹配结果（保留/修改/
+    移动）找到新下标，新下标所属的新（measure, occurrence）单位即映射
+    目标。单位内任一谱音删除/无法匹配 -> 该单位无映射（片段含此单位
+    即失效）；旧单位被拆到多个新单位 -> 降级需复核。
     """
     kind_by_old = {m["old"]["score_index"]: m["kind"]
                    for m in matches if m.get("old")}
-    old_keys = [u[0] for u in old_units]
-    new_keys = [u[0] for u in new_units]
-    pairs = _lcs_pairs(old_keys, new_keys)
+    new_by_old = {e["old_index"]: e["new_index"] for e in old_to_new_map}
+    new_unit_of_idx = {idx: pos
+                       for pos, (key, idxs) in enumerate(new_units)
+                       for idx in idxs}
     mapping = {}
-    for op, npos in pairs:
-        statuses = [_position_status(kind_by_old.get(i))
-                    if kind_by_old.get(i) else INVALID
-                    for i in old_units[op][1]]
-        mapping[op] = {
-            "new_key": (new_units[npos][0][0], new_units[npos][0][1], npos),
-            "status": _worst(statuses),
+    for pos, u in enumerate(old_units):
+        idxs = u["indexes"] if isinstance(u, dict) else u[1]
+        statuses, nps = [], []
+        for i in idxs:
+            kind = kind_by_old.get(i)
+            statuses.append(_position_status(kind) if kind else INVALID)
+            ni = new_by_old.get(i)
+            if ni is not None and ni in new_unit_of_idx:
+                nps.append(new_unit_of_idx[ni])
+        st = _worst(statuses)
+        uniq = sorted(set(nps))
+        if st == INVALID or not uniq:
+            continue  # 无可靠映射：不登记，片段含此单位即失效
+        if len(uniq) > 1:
+            st = REVIEW  # 旧单位被拆到多个新单位
+        npos = uniq[0]
+        key = new_units[npos][0]
+        mapping[pos] = {
+            "new_key": (key[0], key[1], npos),
+            "status": st,
         }
     return mapping
 
@@ -1191,6 +1296,23 @@ def commit_revision(revision_id: str) -> dict:
     for i, n in enumerate(new_notes):
         n["index"] = i
 
+    # 与预览一致：按原谱重新解析取得修正轮次坐标，再以稳定 score_index
+    # 对应旧库 score_notes；无法可靠对应时阻止确认（先校验后写入口）。
+    db_notes = _load_db_notes(source["id"])
+    old_notes, rescore_blockers = _rescore_source(source, db_notes)
+    if rescore_blockers:
+        raise CommitBlockedError(
+            "源谱重新解析后无法与旧库谱音可靠对应，已阻止提交",
+            rescore_blockers)
+    # 重新构建继承判定（与预览一致的确定性结果），取可继承锚点/模板
+    matches, blockers = match_scores(old_notes, new_notes)
+    if blockers:
+        # 理论上不会发生（预览已拦截且输入未变），兜底绝不静默写入口
+        raise CommitBlockedError("重新匹配出现冲突，已阻止提交", blockers)
+    old_to_new = _old_new_index_map(matches)
+    impact = build_impact(source["id"], matches, old_to_new,
+                          db_old_notes=db_notes)
+
     new_piece_id = uuid.uuid4().hex[:12]
     new_title = f"{row['title']}"
     # 新入口的谱文件统一保存为展开前 MusicXML 字节（.mxl 也先解压为 XML，
@@ -1202,21 +1324,6 @@ def commit_revision(revision_id: str) -> dict:
     db.create_revision_piece(new_piece_id, new_title, new_xml_path,
                              source["id"], revision_id)
     db.save_revision_score_notes(new_piece_id, new_notes, warnings)
-
-    # 重新构建继承判定（与预览一致的确定性结果），取可继承锚点/模板
-    old_rows = db.get_score_notes(source["id"])
-    old_notes = [{"index": r["idx"], "midi": float(r["midi"]),
-                  "beat": float(r["beat"]), "dur_q": float(r["dur_q"]),
-                  "measure": r["measure"],
-                  "beat_in_measure": r["beat_in_measure"],
-                  "occurrence": r["occurrence"], "part": r["part"]}
-                 for r in old_rows]
-    matches, blockers = match_scores(old_notes, new_notes)
-    if blockers:
-        # 理论上不会发生（预览已拦截且输入未变），兜底绝不静默写入口
-        raise CommitBlockedError("重新匹配出现冲突，已阻止提交", blockers)
-    old_to_new = _old_new_index_map(matches)
-    impact = build_impact(source["id"], matches, old_to_new)
 
     # 预置可继承的 exclude_score 锚点到新入口（其余锚点只读留旧入口）
     inherited_anchors = []

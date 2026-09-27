@@ -154,7 +154,7 @@ async function openRevision(id) {
 function coord(n) {
   if (!n) return "—";
   return `小节 ${n.measure ?? "?"}`
-    + (n.occurrence ? ` 第${n.occurrence + 1}次` : "")
+    + ` 第${(n.occurrence || 0) + 1}次`
     + ` 拍 ${n.beat_in_measure ?? "?"}`;
 }
 
@@ -219,6 +219,12 @@ function blockerText(b) {
     return `缺原谱坐标：${b.side === "new" ? "修订谱" : "旧谱"} #${b.score_index}`;
   if (b.reason === "ambiguous_move")
     return `移动目标非唯一：旧#${b.old_score_index}（${b.midi_name}）↔ 新#${b.new_score_index}，存在等代价配对`;
+  if (b.reason === "unalignable_measure")
+    return `修订谱小节单位无法对回旧谱：小节 ${b.measure ?? "?"} 第${(b.occurrence || 0) + 1}次，该单位内谱音不静默迁移`;
+  if (b.reason === "source_rescore_mismatch")
+    return `源谱重取坐标无法可靠对应旧库：${b.detail || `谱音 #${b.score_index}`}`;
+  if (b.reason === "source_score_unavailable")
+    return `无法重新解析源 MusicXML 取得修正轮次坐标：${b.detail || ""}`;
   if (b.reason === "source_changed_since_preview")
     return "源 MusicXML 在预览后已变化，请重新生成预览";
   if (b.reason === "source_alignment_changed_since_preview")

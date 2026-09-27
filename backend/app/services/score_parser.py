@@ -5,6 +5,11 @@
 * measure / beat_in_measure / occurrence：原谱坐标（报告与导出使用），
   occurrence 表示该小节因反复第几次演奏（0 基）。
 
+**反复轮次计数规则**：轮次按**展开后的小节实例**计数——同一次演奏
+（展开序列中的同一个小节实例）内的所有音符共用同一 occurrence，
+仅当展开序列再次进入同一原谱小节号时才递增。绝不对小节内逐音
+递增：同一原谱小节有多个音符时，它们在一次演奏中属于同一轮次。
+
 约定：单声部输入。多声部（多 part 或单小节内和弦）只取最高音，
 并把歧义写入 warnings，供前端提示"多声部歧义片段"。
 """
@@ -21,7 +26,7 @@ def parse_musicxml(path: str):
                    occurrence, part}]
     """
     from music21 import converter, note as m21_note, chord as m21_chord
-    from music21 import repeat, stream as m21_stream  # noqa: F401
+    from music21 import stream as m21_stream
 
     score = converter.parse(path)
     warnings = []
@@ -40,37 +45,45 @@ def parse_musicxml(path: str):
         expanded = part
         expansion_ok = False
 
+    # ---- 反复轮次：按展开后的小节实例计数 ----
+    # 展开序列中的每个 Measure 对象是一次“演奏实例”：同一实例内的全部
+    # 音符共用当前轮次；再次进入同一原谱小节号（下一个同号实例）时轮次
+    # 才 +1。无小节结构的极端输入（扁平流）退化为全部轮次 0。
+    measures = list(expanded.getElementsByClass(m21_stream.Measure))
+    if measures:
+        counter: dict[int, int] = {}
+        instances = []  # [(measure_number, occurrence, measure_obj)]
+        for meas in measures:
+            num = meas.number
+            num = num if isinstance(num, int) and not isinstance(num, bool) \
+                else None
+            if num is None:
+                occ = 0
+            else:
+                occ = counter.get(num, 0)
+                counter[num] = occ + 1
+            instances.append((num, occ, meas))
+        el_iter = ((el, num, occ)
+                   for num, occ, meas in instances
+                   for el in meas.recurse())
+    else:
+        el_iter = ((el, None, 0) for el in expanded.recurse())
+
     notes_out = []
-    occurrence_counter = {}
-    visited_measures = set()
     idx = 0
 
-    for el in expanded.recurse():
+    for el, measure, occ in el_iter:
         # 单声部：处理 Note；Chord 取最高音但保留原元素的上下文坐标
         if isinstance(el, m21_note.Note):
             midi = float(el.pitch.midi)
         elif isinstance(el, m21_chord.Chord):
             top = max(el.pitches, key=lambda p: p.midi)
             warnings.append(
-                f"小节 {el.measureNumber} 出现和弦，"
+                f"小节 {measure if measure is not None else '?'} 出现和弦，"
                 f"只取最高音 {top.nameWithOctave}，请人工确认")
             midi = float(top.midi)
         else:
             continue
-
-        try:
-            measure_obj = el.measureNumber
-        except Exception:  # noqa: BLE001
-            measure_obj = None
-        measure = measure_obj if isinstance(measure_obj, int) else None
-
-        # 展开后顺序遍历时，第一次回到已出现过的小节号，即反复的又一次演奏
-        if measure is not None:
-            if measure in visited_measures:
-                occurrence_counter[measure] = occurrence_counter.get(
-                    measure, 0) + 1
-            visited_measures.add(measure)
-        occ = occurrence_counter.get(measure, 0)
 
         try:
             beat_in_measure = float(el.beat)

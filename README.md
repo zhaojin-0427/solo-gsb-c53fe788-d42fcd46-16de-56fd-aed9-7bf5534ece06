@@ -53,7 +53,10 @@
 
 最后提供**谱面修订迁移**：选择一条**已分析录音**及其当前 MusicXML，上传
 一份**修订版单声部 MusicXML**。两侧都用 music21 展开反复后，按
-**（原谱小节、反复轮次、拍位、音高、时值）**做确定性匹配——同谱位且同内容
+**（原谱小节、反复轮次、拍位、音高、时值）**做确定性匹配——轮次按展开后的
+**小节实例**计数（同一次演奏的小节音符共用轮次，仅再次进入该小节时递增），
+预览与确认均**按原谱重新解析**取得修正坐标并以稳定 `score_index` 对应旧库
+谱音，无法可靠对应时在预览说明原因并阻止确认——同谱位且同内容
 为**保留**，同谱位改音高/时值为**修改**，同内容换谱位为**移动**（全局单调
 序列对齐，移动代价 = 展开单位跨越 + 拍位距离，等代价配对即歧义），旧谱
 独有为**删除**、新谱独有为**新增**，结构冲突谱位为**无法匹配**。基于匹配
@@ -63,9 +66,9 @@
 **谱面修订记录**与**供后续录音使用的复盘入口**，并预置可继承的排除锚点；
 之后可向新入口上传后续录音，分析完成后把**可继承/需复核**的处方与练习谱
 **一键接续**为全新对象（练习谱接续仍逐位准入，不通过返回 422 且不生成）。
-**匹配冲突（谱位键重复/缺坐标/等代价移动）或多声部歧义必须阻止提交**；
-预览后来源谱或对齐版本变化同样阻止。报告可导出**确定性 JSON**
-（键排序、固定精度、无时间戳随机项）。
+**匹配冲突（谱位键重复/缺坐标/等代价移动/源谱重取坐标不可靠）或多声部
+歧义必须阻止提交**；预览后来源谱或对齐版本变化同样阻止。报告可导出
+**确定性 JSON**（键排序、固定精度、无时间戳随机项）。
 
 技术栈：Python 3.11 · FastAPI · SQLite · music21 · librosa；前端原生
 JavaScript（无构建步骤，第五个标签页为谱面修订迁移）；Docker Compose
@@ -85,9 +88,13 @@ docker compose up --build          # 前台启动；加 -d 可后台运行
 健康检查（`GET /api/health`），启动后浏览器访问：
 
 > **http://localhost:8000**
-> （合成轨在“多次演奏对比”页内向下滚动；偏差练习处方在第三个标签页；
-> 偏差片段练习谱在第四个标签页；谱面修订迁移在第五个标签页，也可从单次
-> 复盘页直接进入）
+>
+> * 单次复盘：第一个标签页（上传 MusicXML + WAV）；
+> * 多次演奏对比 / 最佳片段合成轨：第二个标签页（合成轨在页内向下滚动）；
+> * 偏差练习处方：第三个标签页；偏差片段练习谱：第四个标签页；
+> * **谱面修订迁移：第五个标签页**——先在“单次复盘”页打开一支已分析
+>   录音，再点侧栏 **“＋ 谱面修订迁移”** 上传修订版单声部 MusicXML
+>   生成迁移预览（详见 §2f）。
 
 数据（上传文件、SQLite 数据库）持久化在宿主机 `./data` 目录。
 停止：`Ctrl+C` 或 `docker compose down`；想彻底清空：`rm -rf data/`。
@@ -454,6 +461,12 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
    `.xml/.musicxml/.mxl`。上传时先做**多声部静态扫描**——检测到多 part、
    小节内多 voice 或任意 `<chord/>` 直接 **422 `polyphony_ambiguous`**，
    不生成预览；随后用 music21 对两侧谱面都 `expandRepeats()`。
+   **反复轮次按展开后的小节实例计数**：同一次演奏（展开序列中的同一个
+   小节实例）内的所有音符共用同一 `occurrence`，仅再次进入同一原谱小节
+   时才递增——同一小节有多个音符不会逐音递增。预览与确认都**按原谱重新
+   解析**源 MusicXML 取得修正轮次后的坐标，再以**稳定 `score_index`**
+   （展开顺序下标）逐位对应旧库 `score_notes`（音高/展开拍位/时值必须
+   一致）；旧库记录本身**只读不改写**，旧下标引用不漂移。
 2. **确定性匹配（按原谱坐标 + 内容）**：对展开后的两侧谱音做一次全局单调
    序列对齐（公开代价，报告 `params` 段完整携带）：
 
@@ -474,7 +487,11 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
    * `polyphony_ambiguous`：修订谱多声部 / 和弦（上传阶段即拒绝）；
    * `duplicate_position`：同一（小节/轮次/拍位）有多个谱音，匹配键不唯一；
    * `missing_coordinate`：谱音缺原谱小节或拍位坐标；
-   * `ambiguous_move`：等代价移动配对，迁移目标非唯一。
+   * `ambiguous_move`：等代价移动配对，迁移目标非唯一；
+   * `source_rescore_mismatch` / `source_score_unavailable`：按原谱重新
+     解析取得的坐标无法与旧库 `score_notes` 按稳定下标可靠对应
+     （数量或音高/展开拍位/时值不一致，或源谱无法解析）——预览逐项
+     说明原因并阻止确认，绝不沿用旧库中可能错位的轮次坐标静默匹配。
 
    含冲突的预览可以保存查看（`has_blockers=true`、`can_commit=false`），
    但**确认按钮禁用 / 接口 422**；可“放弃预览”删除后重新上传。
@@ -491,12 +508,17 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
    | 练习谱片段 | 展开单位全部保留：生成接续模板 | 单位内有移动/修改或映射后不连续 | 单位消失/无法对回 |
 
    每个判定都带中文**原因**（如“谱位为移动：请在新录音复盘时复核是否
-   仍需排除”“快照固化的是旧谱指纹与旧录音的逐音结论”）。
+   仍需排除”“快照固化的是旧谱指纹与旧录音的逐音结论”）。练习谱片段的
+   旧展开单位位置（`order_start/order_end`）一律按**旧库原样数据**解析
+   ——与片段创建时的展开顺序一致，旧下标引用不漂移；单位到修订谱的映射
+   经**稳定 `score_index`** 完成（旧轮次计数拆出的多个旧单位折叠进同一
+   新单位时仍正确判为保留，不错配谱位）。
 5. **确认提交（禁止静默改写历史）**：点 **✓ 确认迁移**（自动/手填
    `request_id`，幂等回放首次响应，含 422）。系统再次核对：修订谱 sha256、
-   来源谱 sha256、来源对齐版本与预览固化时一致——**预览后来源变化**
-   （重新对齐 / 谱文件变化）返回 422 `source_*_changed_since_preview`，
-   必须重新上传生成预览。通过后：
+   来源谱 sha256、来源对齐版本与预览固化时一致，并**重新按原谱解析核对
+   与旧库谱音的稳定下标对应**——**预览后来源变化**（重新对齐 / 谱文件
+   变化）返回 422 `source_*_changed_since_preview`，重取坐标不可靠返回
+   422 `source_rescore_mismatch`，必须重新上传生成预览。通过后：
    * 创建新的 `score_revisions` 行（`status=committed`）与**新复盘入口
      piece**（复制修订谱为 `{new_id}.xml`、写入展开谱音，状态 `created`，
      尚无音频），并把**可继承的排除锚点**预置到新入口（其余锚点只读留旧
@@ -524,6 +546,7 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
 | 放弃预览 | 记录与修订文件删除 | — | DELETE 200 |
 | 确认提交（request_id 幂等） | `committed`（只读不可删） | 创建 piece + 预置可继承锚点 | commit 200 |
 | 预览后来源谱/对齐版本变化 | 仍为 `preview` | 阻止提交 | commit **422** |
+| 源谱重取坐标与旧库无法可靠对应 | `preview` + `has_blockers` | 预览列明原因，阻止确认 | commit **422** |
 | 已提交重复确认 | — | 回放首次响应（同 new_piece_id） | commit 200/409 |
 | 新入口上传录音 | `committed` | 后台分析→`analyzed` | POST audio 200 |
 | 一键接续处方 | `committed` | 生成**全新**处方 | carryover 200 |
@@ -556,7 +579,10 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
 
 1. **反复展开**：`music21` 的 `part.expandRepeats()` 展开 D.C./D.S./反复小节
    与结尾，得到展开后四分音符坐标 `beat`；同时保留
-   `measure / beat_in_measure / occurrence` 原谱坐标。和弦只取最高音并告警。
+   `measure / beat_in_measure / occurrence` 原谱坐标。**轮次按展开后的
+   小节实例计数**：同一次演奏的小节实例内所有音符共用同一 `occurrence`，
+   仅展开序列再次进入同一原谱小节号时递增（同一小节多个音符绝不逐音
+   递增）。和弦只取最高音并告警。
 2. **音频分析**（librosa，22.05kHz 单声道）：`onset_strength + peak_pick`
    检测起音（合并 60ms 内过近起音）；每段 `pyin` 基频 + 频谱第二峰占比，
    输出 `stable / poly / silent` 三态与各自置信指标；另输出 1000 点波形
@@ -711,6 +737,7 @@ GET `/api/practice-scores/{id}` 返回：`status`、`current_version`、
 │   │   ├── test_prescription_api.py # 处方接口：409 兼容拒绝/幂等/重绑
 │   │   ├── test_practice_score.py # 练习谱：准入/提取/连音截断/循环速度/固化过期
 │   │   ├── test_practice_score_api.py # 练习谱接口：422 逐位阻止/下载/重建/删除
+│   │   ├── test_score_parser.py   # 反复轮次：按展开后小节实例计数（桩替代 music21）
 │   │   ├── test_revision.py       # 谱面修订：六类匹配/冲突阻止/继承判定/提交/接续
 │   │   └── test_revision_api.py   # 修订接口：422 多声部/幂等提交/只读/报告/接续
 │   └── sample/                 # 示例 MusicXML 与 WAV 生成脚本
@@ -735,6 +762,7 @@ python3 tests/test_prescription.py  # 处方：固化/逐段判定/证据/不可
 python3 tests/test_prescription_api.py # 处方接口：幂等回放/409 拒绝/404/候选
 python3 tests/test_practice_score.py # 练习谱：准入/提取/连音截断/循环速度/多版本固化过期
 python3 tests/test_practice_score_api.py # 练习谱接口：422 逐位/版本历史/逐版本下载/重建不改写/删除全清
+python3 tests/test_score_parser.py  # 反复轮次：同一次演奏的小节音符共用轮次，再次进入才递增
 python3 tests/test_revision.py      # 修订匹配：保留/修改/移动/删除/新增 + 冲突阻止 + 继承判定 + 提交/接续
 python3 tests/test_revision_api.py  # 修订接口：多声部 422/幂等提交回放/committed 只读/确定性报告
 ```

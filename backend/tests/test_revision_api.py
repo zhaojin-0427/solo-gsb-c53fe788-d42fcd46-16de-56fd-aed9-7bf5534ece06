@@ -35,8 +35,18 @@ from app.services import revision as rv  # noqa: E402
 from app.services import review  # noqa: E402
 
 _PENDING_REV = []
-rv.score_parser.parse_musicxml = lambda path: \
-    ([dict(n) for n in _PENDING_REV], [])
+_SOURCE_SCORES = {}
+
+
+def _fake_parse(path):
+    # 源谱路径返回登记的“重新解析（修正轮次）”结果；修订谱临时文件
+    # 返回 _PENDING_REV
+    if path in _SOURCE_SCORES:
+        return [dict(n) for n in _SOURCE_SCORES[path]], []
+    return [dict(n) for n in _PENDING_REV], []
+
+
+rv.score_parser.parse_musicxml = _fake_parse
 
 
 def note(i, midi, m, b, occ=0):
@@ -73,14 +83,16 @@ def seed():
     db.init_db()
     old = [note(i, 60 + (i % 4), i // 2 + 1, (i % 2) * 2 + 1)
            for i in range(8)]
-    db.create_piece("p1", "测试曲", os.path.join(TMP, "files", "p1.xml"))
+    xml_path = os.path.join(TMP, "files", "p1.xml")
+    db.create_piece("p1", "测试曲", xml_path)
     db.save_analysis("p1", os.path.join(TMP, "files", "p1.wav"), 12.0,
                      score_rows(old), obs_rows(old), [], [])
-    open(os.path.join(TMP, "files", "p1.xml"), "w",
-         encoding="utf-8").write(XML)
+    open(xml_path, "w", encoding="utf-8").write(XML)
     open(os.path.join(TMP, "files", "p1.wav"), "wb").write(b"RIFF")
     db.add_anchor("p1", "exclude_score", 0, None, "x")
     review.recompute("p1")
+    # 源谱重新解析（修正轮次）的结果：与旧库记录一致
+    _SOURCE_SCORES[xml_path] = [dict(n) for n in old]
     return old
 
 

@@ -8,6 +8,10 @@
     （失效）、未过期/已过期对比、处方与练习谱模板；
   * 确认提交：冲突阻止、来源变化阻止、成功后新建只读复盘入口并预置
     可继承锚点；旧记录只读不可删、不改写；幂等提交；
+  * 反复轮次修正：旧库逐音递增的错误轮次不改写（只读），预览/确认按
+    原谱重新解析取得修正坐标并以稳定 score_index 对应旧库；练习谱片段
+    的旧展开单位位置不漂移（多个旧单位折叠进同一新单位仍可继承）；
+  * 源谱重取坐标无法可靠对应（数量/内容不一致）：预览说明原因并阻止确认；
   * 接续模板：处方下标区间映射、练习谱展开单位映射；
   * 确定性报告 JSON：无时间戳/随机项，重复生成字节级一致。
 
@@ -30,12 +34,19 @@ from app import db  # noqa: E402
 from app.services import revision as rv  # noqa: E402
 from app.services import review  # noqa: E402
 
-# music21 不可用：解析桩返回“当前待处理修订谱音”（测试在 create_revision
-# 前置入 _PENDING_REV），反复展开语义已在 match_scores 中独立验证。
+# music21 不可用：解析桩按路径分发——源谱路径返回 _SOURCE_SCORES 登记的
+# “按原谱重新解析（修正轮次）”的结果，其余（修订谱临时文件）返回
+# _PENDING_REV。反复展开语义已在 match_scores 中独立验证。
 _PENDING_REV = []
+_SOURCE_SCORES = {}
 
 
 def _fake_parse(path):
+    if path in _SOURCE_SCORES:
+        val = _SOURCE_SCORES[path]
+        if val is None:
+            raise ValueError("源 MusicXML 无法解析（桩）")
+        return [dict(n) for n in val], []
     return [dict(n) for n in _PENDING_REV], []
 
 
@@ -74,15 +85,18 @@ XML = ('<score-partwise version="3.1"><part-list><score-part id="P1">'
        '</pitch></note></measure></part></score-partwise>')
 
 
-def seed_piece(pid, old_notes, wrong=()):
-    db.create_piece(pid, f"测试曲{pid}", os.path.join(TMP, "files", f"{pid}.xml"))
+def seed_piece(pid, old_notes, wrong=(), source_notes=None):
+    xml_path = os.path.join(TMP, "files", f"{pid}.xml")
+    db.create_piece(pid, f"测试曲{pid}", xml_path)
     db.save_analysis(pid, os.path.join(TMP, "files", f"{pid}.wav"), 12.0,
                      score_rows(old_notes), obs_rows(old_notes, wrong),
                      [], [])
-    open(os.path.join(TMP, "files", f"{pid}.xml"), "w",
-         encoding="utf-8").write(XML)
+    open(xml_path, "w", encoding="utf-8").write(XML)
     open(os.path.join(TMP, "files", f"{pid}.wav"), "wb").write(b"RIFF")
     review.recompute(pid)
+    # 源谱重新解析（修正轮次）的结果；默认与旧库记录一致
+    _SOURCE_SCORES[xml_path] = [dict(n) for n in (
+        source_notes if source_notes is not None else old_notes)]
 
 
 # ------------------------------------------------------------ 匹配行为
@@ -351,6 +365,117 @@ def test_source_change_after_preview_blocks():
     print("OK source change after preview blocks commit")
 
 
+# ------------------------------------------------------------ 轮次修正
+
+def mnote(i, midi, m, b, occ, beat, dur=2.0):
+    """显式展开坐标的谱音（beat 与 occ 解耦，模拟同一演奏实例）。"""
+    return {"index": i, "midi": float(midi), "beat": float(beat),
+            "dur_q": float(dur), "measure": m,
+            "beat_in_measure": float(b), "occurrence": occ, "part": 0}
+
+
+def test_rescore_corrects_buggy_occurrence():
+    """旧库轮次错位（逐音递增）时，迁移按原谱重取坐标 + 稳定下标对应。"""
+    # 小节 1 两个音、反复演奏两遍：旧库错误地把轮次记成 0,1,2,3；
+    # 修正后同一次演奏的小节音符共用轮次：0,0,1,1（展开 beat 不变）。
+    buggy = [mnote(0, 60, 1, 1, 0, 0.0), mnote(1, 62, 1, 3, 1, 2.0),
+             mnote(2, 60, 1, 1, 2, 4.0), mnote(3, 62, 1, 3, 3, 6.0)]
+    fixed = [mnote(0, 60, 1, 1, 0, 0.0), mnote(1, 62, 1, 3, 0, 2.0),
+             mnote(2, 60, 1, 1, 1, 4.0), mnote(3, 62, 1, 3, 1, 6.0)]
+    seed_piece("p_occ", buggy, source_notes=fixed)
+    db.add_anchor("p_occ", "exclude_score", 1, None, "keep1")
+
+    # 修订谱：内容完全一致的修正坐标谱（轮次 0,0,1,1）
+    _set_pending_rev(fixed)
+    rev_id = rv.create_revision("p_occ", rev_xml("occ"), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert rev["can_commit"], rev["blockers"]
+    kinds = {m["old"]["score_index"]: m["kind"] for m in rev["matches"]
+             if m.get("old")}
+    assert kinds and all(k == "kept" for k in kinds.values()), kinds
+    # 锚点按修正坐标判定为可继承，并映射到稳定下标 1
+    anc = next(a for a in rev["impact"]
+               if a["artifact"] == "anchor" and a["kind"] == "exclude_score")
+    assert anc["status"] == "inheritable" and anc["new_score_index"] == 1
+
+    committed = rv.commit_revision(rev_id)
+    new_pid = committed["new_piece_id"]
+    # 新入口谱音使用正确轮次
+    assert [r["occurrence"] for r in db.get_score_notes(new_pid)] \
+        == [0, 0, 1, 1]
+    # 继承锚点预置到新入口的稳定下标 1
+    assert any(a["kind"] == "exclude_score" and a["score_index"] == 1
+               for a in db.get_anchors(new_pid))
+    # 旧库 score_notes 保持只读：旧轮次不被改写、旧下标引用不漂移
+    assert [r["occurrence"] for r in db.get_score_notes("p_occ")] \
+        == [0, 1, 2, 3]
+    print("OK rescore corrects buggy occurrence; old rows stay read-only")
+
+
+def test_practice_segment_mapping_drift_free():
+    """练习谱片段的旧展开单位位置按旧库数据解析（不漂移），经稳定
+    score_index 映射到修订谱单位；旧错误轮次拆出的多个旧单位折叠进
+    同一新单位时仍判可继承，不错报失效。"""
+    buggy = [mnote(0, 60, 1, 1, 0, 0.0), mnote(1, 62, 1, 3, 1, 2.0)]
+    fixed = [mnote(0, 60, 1, 1, 0, 0.0), mnote(1, 62, 1, 3, 0, 2.0)]
+    seed_piece("p_seg", buggy, source_notes=fixed)
+    # 旧库展开单位：(1,第1次):[#0]、(1,第2次):[#1]（错误轮次把同一次
+    # 演奏的小节拆成两个单位）；片段在创建时框选 order 0..1
+    seg = {"measure_start": 1, "occurrence_start": 0,
+           "measure_end": 1, "occurrence_end": 1,
+           "order_start": 0, "order_end": 1,
+           "loops": 2, "start_tempo_bpm": 60.0,
+           "tempo_increment_bpm": 0.0, "tempo_direction": "same"}
+    db.create_practice_score("ps_seg", "p_seg", "练习",
+                             json.dumps([seg], ensure_ascii=False), "{}")
+    _set_pending_rev(fixed)
+    rev_id = rv.create_revision("p_seg", rev_xml("seg"), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert rev["can_commit"], rev["blockers"]
+    item = next(a for a in rev["impact"]
+                if a["artifact"] == "practice_score")
+    assert item["status"] == "inheritable", item
+    assert item["segments"][0]["new_units"] == [[1, 0]], item["segments"]
+    print("OK practice segment mapping is drift-free")
+
+
+def test_rescore_mismatch_blocks():
+    """源谱重取坐标与旧库无法可靠对应：预览说明原因并阻止确认。"""
+    old = [note(0, 60, 1, 1), note(1, 62, 1, 3)]
+    diverged = [note(0, 60, 1, 1), note(1, 64, 1, 3)]  # #1 音高不一致
+    seed_piece("p_mis", old, source_notes=diverged)
+    db.add_anchor("p_mis", "exclude_score", 0, None, "a0")
+    _set_pending_rev(old)
+    rev_id = rv.create_revision("p_mis", rev_xml("mis"), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert not rev["can_commit"] and rev["has_blockers"]
+    assert any(b["reason"] == "source_rescore_mismatch"
+               and b.get("score_index") == 1 for b in rev["blockers"])
+    # 继承状态无法判定：全部失效并说明原因
+    assert rev["impact"], "应有影响项（锚点）"
+    assert all(it["status"] == "invalid" for it in rev["impact"])
+    assert any("可靠对应" in r for it in rev["impact"]
+               for r in it["reasons"])
+    # 阻止确认
+    try:
+        rv.commit_revision(rev_id)
+        raise AssertionError("无法可靠对应时必须阻止提交")
+    except rv.CommitBlockedError as exc:
+        assert any(b["reason"] == "source_rescore_mismatch"
+                   for b in exc.blockers)
+    assert rv.delete_preview(rev_id)
+
+    # 数量不一致同样阻止
+    seed_piece("p_mis2", old, source_notes=old + [note(2, 65, 2, 1)])
+    _set_pending_rev(old)
+    rev2 = rv.get_revision(
+        rv.create_revision("p_mis2", rev_xml("mis2"), None)["id"])
+    assert not rev2["can_commit"]
+    assert any(b["reason"] == "source_rescore_mismatch"
+               for b in rev2["blockers"])
+    print("OK rescore mismatch blocks preview and commit")
+
+
 def main():
     db.init_db()
     test_match_classification()
@@ -362,6 +487,9 @@ def main():
     test_end_to_end()
     test_blocked_preview_cannot_commit()
     test_source_change_after_preview_blocks()
+    test_rescore_corrects_buggy_occurrence()
+    test_practice_segment_mapping_drift_free()
+    test_rescore_mismatch_blocks()
     print("REVISION OK")
 
 
