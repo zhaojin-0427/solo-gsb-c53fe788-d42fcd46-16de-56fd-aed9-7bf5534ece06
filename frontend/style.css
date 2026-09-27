@@ -108,6 +108,7 @@ ul { list-style: none; margin: 0; padding: 0; }
 }
 #time-readout { font-variant-numeric: tabular-nums; color: var(--muted); }
 .transport-hint { color: var(--muted); font-size: 11px; }
+.transport-hint.warn { color: var(--missing); }
 
 .legend {
   margin-left: auto; display: flex; align-items: center; gap: 4px;

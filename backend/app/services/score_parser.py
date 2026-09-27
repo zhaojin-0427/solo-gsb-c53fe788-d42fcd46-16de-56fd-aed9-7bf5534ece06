@@ -3,7 +3,8 @@
 每个期望音符同时带两套坐标：
 * beat / dur_q：展开后的四分音符坐标（对齐与播放使用）；
 * measure / beat_in_measure / occurrence：原谱坐标（报告与导出使用），
-  occurrence 表示该小节因反复第几次演奏（0 基）。
+  occurrence 为反复轮次（0 基），按**展开后的小节实例**计数——同一次
+  演奏的小节内全部音符共用同一轮次，仅再次进入同号小节时递增。
 
 约定：单声部输入。多声部（多 part 或单小节内和弦）只取最高音，
 并把歧义写入 warnings，供前端提示"多声部歧义片段"。
@@ -12,6 +13,22 @@
 from __future__ import annotations
 
 from .. import config as C  # noqa: F401
+
+
+def measure_occurrences(measure_numbers):
+    """展开后的小节实例序列 -> 每个实例的反复轮次（0 基）。
+
+    ``measure_numbers`` 每个元素是一个小节实例的原谱小节号（同一小节在
+    反复展开中再次出现时重复其小节号，``None`` 表示无有效小节号）。
+    轮次按**展开后的小节实例**计数：同一次演奏的小节（实例内全部音符）
+    共用同一 occurrence，仅再次进入同号小节（反复 / 房子）时递增。
+    """
+    counter: dict = {}
+    out = []
+    for num in measure_numbers:
+        counter[num] = counter.get(num, -1) + 1
+        out.append(counter[num])
+    return out
 
 
 def parse_musicxml(path: str):
@@ -40,9 +57,15 @@ def parse_musicxml(path: str):
         expanded = part
         expansion_ok = False
 
+    # 反复轮次按**展开后的小节实例**计数（见 measure_occurrences）：
+    # 顺序遍历时跟踪“当前所属小节实例”——进入一个新实例时为该小节号
+    # 递增计数，实例内的全部音符共用同一 occurrence；只有再次进入同号
+    # 小节（反复 / 房子）时才递增，绝不随小节内音符逐个递增。
     notes_out = []
     occurrence_counter = {}
-    visited_measures = set()
+    cur_measure_id = None
+    cur_measure = None
+    cur_occ = 0
     idx = 0
 
     for el in expanded.recurse():
@@ -59,18 +82,21 @@ def parse_musicxml(path: str):
             continue
 
         try:
-            measure_obj = el.measureNumber
+            measure_obj = el.getContextByClass(m21_stream.Measure)
         except Exception:  # noqa: BLE001
             measure_obj = None
-        measure = measure_obj if isinstance(measure_obj, int) else None
-
-        # 展开后顺序遍历时，第一次回到已出现过的小节号，即反复的又一次演奏
-        if measure is not None:
-            if measure in visited_measures:
-                occurrence_counter[measure] = occurrence_counter.get(
-                    measure, 0) + 1
-            visited_measures.add(measure)
-        occ = occurrence_counter.get(measure, 0)
+        if measure_obj is not None:
+            if id(measure_obj) != cur_measure_id:
+                # 展开顺序中进入了一个新的小节实例：为该小节号递增轮次
+                m_num = measure_obj.number
+                cur_measure = m_num if isinstance(m_num, int) else None
+                occurrence_counter[cur_measure] = \
+                    occurrence_counter.get(cur_measure, -1) + 1
+                cur_occ = occurrence_counter[cur_measure]
+                cur_measure_id = id(measure_obj)
+            measure, occ = cur_measure, cur_occ
+        else:
+            measure, occ = None, 0
 
         try:
             beat_in_measure = float(el.beat)

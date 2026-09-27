@@ -154,7 +154,7 @@ async function openRevision(id) {
 function coord(n) {
   if (!n) return "—";
   return `小节 ${n.measure ?? "?"}`
-    + (n.occurrence ? ` 第${n.occurrence + 1}次` : "")
+    + (n.occurrence ? ` 第${n.occurrence + 1}次` : " 第1次")
     + ` 拍 ${n.beat_in_measure ?? "?"}`;
 }
 
@@ -165,6 +165,13 @@ function renderRevision(rev) {
     + ` · 固化对齐 v${rev.source_alignment_version}`
     + ` · ${rev.status === "committed" ? "已确认提交（只读）" : "预览"}`
     + ` · 创建 ${rev.created_at}`;
+
+  // 轮次坐标策略（反复轮次按展开后的小节实例计数；无法可靠对应时阻止确认）
+  $("#revision-coord-policy").textContent = rev.source_coordinate_policy
+    ? `轮次坐标：${rev.source_coordinate_policy}`
+    : "";
+  $("#revision-coord-policy").classList.toggle("warn",
+    rev.source_reparse_reliable === false);
 
   // 下载
   $("#revision-download-xml").href = rev.revised_musicxml_url;
@@ -219,6 +226,8 @@ function blockerText(b) {
     return `缺原谱坐标：${b.side === "new" ? "修订谱" : "旧谱"} #${b.score_index}`;
   if (b.reason === "ambiguous_move")
     return `移动目标非唯一：旧#${b.old_score_index}（${b.midi_name}）↔ 新#${b.new_score_index}，存在等代价配对`;
+  if (b.reason === "source_reparse_mismatch")
+    return `原谱重解析对应失败（已阻止确认）：${b.detail || "按原谱重新取得的坐标与旧库记录无法可靠对应"}`;
   if (b.reason === "source_changed_since_preview")
     return "源 MusicXML 在预览后已变化，请重新生成预览";
   if (b.reason === "source_alignment_changed_since_preview")

@@ -29,13 +29,19 @@ sys.path.insert(0, BACKEND)
 from app import db  # noqa: E402
 from app.services import revision as rv  # noqa: E402
 from app.services import review  # noqa: E402
+from app.services import score_parser  # noqa: E402
 
-# music21 不可用：解析桩返回“当前待处理修订谱音”（测试在 create_revision
-# 前置入 _PENDING_REV），反复展开语义已在 match_scores 中独立验证。
+# music21 不可用：解析桩按路径分发——源谱重新解析返回 _SOURCE_PARSES
+# 中登记的结果（模拟“按原谱重新取得坐标”），其余路径（修订谱临时文件）
+# 返回 _PENDING_REV（测试在 create_revision 前置入）。反复展开语义已在
+# match_scores 中独立验证。
 _PENDING_REV = []
+_SOURCE_PARSES = {}
 
 
 def _fake_parse(path):
+    if path in _SOURCE_PARSES:
+        return [dict(n) for n in _SOURCE_PARSES[path]], []
     return [dict(n) for n in _PENDING_REV], []
 
 
@@ -49,6 +55,13 @@ def note(i, midi, m, b, occ=0, dur=1.0):
     return {"index": i, "midi": float(midi), "beat": float(beat),
             "dur_q": float(dur), "measure": m,
             "beat_in_measure": float(b), "occurrence": occ, "part": 0}
+
+
+def xnote(i, midi, m, b, occ, beat):
+    """显式给定展开拍位的谱音（轮次与 beat 解耦，模拟旧库错误轮次）。"""
+    return {"index": i, "midi": float(midi), "beat": float(beat),
+            "dur_q": 1.0, "measure": m, "beat_in_measure": float(b),
+            "occurrence": occ, "part": 0}
 
 
 def score_rows(notes):
@@ -74,14 +87,19 @@ XML = ('<score-partwise version="3.1"><part-list><score-part id="P1">'
        '</pitch></note></measure></part></score-partwise>')
 
 
-def seed_piece(pid, old_notes, wrong=()):
-    db.create_piece(pid, f"测试曲{pid}", os.path.join(TMP, "files", f"{pid}.xml"))
+def seed_piece(pid, old_notes, wrong=(), reparsed=None):
+    xml_path = os.path.join(TMP, "files", f"{pid}.xml")
+    db.create_piece(pid, f"测试曲{pid}", xml_path)
     db.save_analysis(pid, os.path.join(TMP, "files", f"{pid}.wav"), 12.0,
                      score_rows(old_notes), obs_rows(old_notes, wrong),
                      [], [])
-    open(os.path.join(TMP, "files", f"{pid}.xml"), "w",
-         encoding="utf-8").write(XML)
+    open(xml_path, "w", encoding="utf-8").write(XML)
     open(os.path.join(TMP, "files", f"{pid}.wav"), "wb").write(b"RIFF")
+    # 源谱“按原谱重新解析”的桩结果：默认与库内一致；需要模拟旧库错误
+    # 轮次 / 对应失败时由调用方显式给出 reparsed。
+    _SOURCE_PARSES[xml_path] = [dict(n) for n in
+                                (reparsed if reparsed is not None
+                                 else old_notes)]
     review.recompute(pid)
 
 
@@ -351,6 +369,262 @@ def test_source_change_after_preview_blocks():
     print("OK source change after preview blocks commit")
 
 
+# ------------------------------------------------------------ 反复轮次修复
+
+def test_measure_occurrences_per_instance():
+    # 轮次按展开后的小节实例计数：同一次演奏的小节音符共用 occurrence，
+    # 仅再次进入该小节时递增
+    assert score_parser.measure_occurrences([1, 2, 1, 2, 3]) == \
+        [0, 0, 1, 1, 0]
+    assert score_parser.measure_occurrences([1, 1, 1]) == [0, 1, 2]
+    assert score_parser.measure_occurrences([4]) == [0]
+    assert score_parser.measure_occurrences([None, 1, None]) == [0, 0, 1]
+    print("OK occurrence counted per expanded measure instance")
+
+
+def test_occurrence_corrected_via_reparse():
+    """旧库 score_notes 是“同小节逐音递增轮次”的错误解析；预览/确认必须
+    按原谱重新取得的正确轮次匹配，旧库行保持只读。"""
+    # 小节 1 四个四分音符 C D E F，反复一遍（展开 m1 ×2，beat 0..7）
+    midis = [60, 62, 64, 65]
+    stored = [xnote(i, midis[i % 4], 1, i % 4 + 1, i, i) for i in range(4)]
+    stored += [xnote(4 + i, midis[i], 1, i + 1, 4 + i, 4 + i)
+               for i in range(4)]           # 旧库错误轮次 0..7
+    correct = [xnote(i, midis[i % 4], 1, i % 4 + 1, i // 4, i)
+               for i in range(8)]            # 正确轮次 0,0,0,0,1,1,1,1
+    seed_piece("p_occ", stored, reparsed=correct)
+    db.add_anchor("p_occ", "exclude_score", 2, None, "keep-me")
+
+    # 修订谱：第二遍的第 3 音 E(64) 改为 G#(68)，其余原样
+    new = [xnote(i, midis[i % 4], 1, i % 4 + 1, i // 4, i) for i in range(8)]
+    new[6]["midi"] = 68.0
+    _set_pending_rev(new)
+    rev_id = rv.create_revision("p_occ", rev_xml("occ"), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert rev["can_commit"], rev["blockers"]
+    s = rev["summary"]
+    assert s["kept"] == 7 and s["modified"] == 1 and s["deleted"] == 0, s
+    # 匹配使用的是修正后的轮次（只会出现 0/1，而不是旧库的 0..7）
+    old_occs = {m["old"]["occurrence"] for m in rev["matches"] if m.get("old")}
+    assert old_occs == {0, 1}, old_occs
+    mod = next(m for m in rev["matches"] if m["kind"] == "modified")
+    assert mod["old"]["occurrence"] == 1
+    assert mod["old"]["beat_in_measure"] == 3.0
+    assert mod["old"]["midi"] == 64.0 and mod["new"]["midi"] == 68.0
+    # 旧库行保持只读：错误轮次不被改写，旧下标不漂移
+    assert [r["occurrence"] for r in db.get_score_notes("p_occ")] == \
+        [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # 确认提交：新入口谱音使用正确轮次；保留谱位的排除锚点被继承
+    committed = rv.commit_revision(rev_id)
+    new_pid = committed["new_piece_id"]
+    assert [r["occurrence"] for r in db.get_score_notes(new_pid)] == \
+        [0, 0, 0, 0, 1, 1, 1, 1]
+    assert any(a["kind"] == "exclude_score" and a["score_index"] == 2
+               for a in db.get_anchors(new_pid))
+    print("OK occurrence corrected via source re-parse (preview + commit)")
+
+
+def test_source_reparse_mismatch_blocks():
+    """按原谱重新取得的坐标与旧库无法可靠对应：预览说明原因并阻止确认。"""
+    # 音符数不一致（源谱文件在分析后被替换）
+    old = [note(0, 60, 1, 1), note(1, 62, 1, 3)]
+    seed_piece("p_mis", old)
+    _SOURCE_PARSES[os.path.join(TMP, "files", "p_mis.xml")] = [note(0, 60, 1, 1)]
+    _set_pending_rev(old)
+    rev_id = rv.create_revision("p_mis", rev_xml("mis"), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert not rev["can_commit"] and rev["has_blockers"]
+    blk = [b for b in rev["blockers"]
+           if b["reason"] == "source_reparse_mismatch"]
+    assert blk and "无法建立稳定" in blk[0]["detail"]
+    try:
+        rv.commit_revision(rev_id)
+        raise AssertionError("无法可靠对应时必须阻止确认")
+    except rv.CommitBlockedError as exc:
+        assert any(b["reason"] == "source_reparse_mismatch"
+                   for b in exc.blockers)
+    assert rv.delete_preview(rev_id)
+
+    # 内容级不一致（音高漂移）同样阻止，并说明具体位置
+    seed_piece("p_mis2", old)
+    _SOURCE_PARSES[os.path.join(TMP, "files", "p_mis2.xml")] = [
+        note(0, 60, 1, 1), note(1, 63, 1, 3)]
+    _set_pending_rev(old)
+    rev2 = rv.get_revision(
+        rv.create_revision("p_mis2", rev_xml("mis2"), None)["id"])
+    assert not rev2["can_commit"]
+    blk2 = [b for b in rev2["blockers"]
+            if b["reason"] == "source_reparse_mismatch"]
+    assert blk2 and "第 1 音" in blk2[0]["detail"]
+    try:
+        rv.commit_revision(rev2["id"])
+        raise AssertionError("内容漂移必须阻止确认")
+    except rv.CommitBlockedError:
+        pass
+    print("OK source re-parse mismatch blocks preview and commit")
+
+
+def _legacy_practice_segments():
+    """轮次修复前创建的练习谱片段：库内每音一个单位（order 0..7），
+    段1=小节1 全部（order 0..3），段2=小节2 全部（order 4..7）。"""
+    return [
+        {"measure_start": 1, "occurrence_start": 0,
+         "measure_end": 1, "occurrence_end": 3,
+         "order_start": 0, "order_end": 3, "loops": 1,
+         "start_tempo_bpm": 60.0, "tempo_increment_bpm": 0.0,
+         "tempo_direction": "same"},
+        {"measure_start": 2, "occurrence_start": 0,
+         "measure_end": 2, "occurrence_end": 3,
+         "order_start": 4, "order_end": 7, "loops": 1,
+         "start_tempo_bpm": 60.0, "tempo_increment_bpm": 0.0,
+         "tempo_direction": "same"},
+    ]
+
+
+def _seed_legacy_practice_piece(pid):
+    """旧库：m1/m2 各 4 音，错误轮次（同小节逐音递增）；重解析为正确轮次。"""
+    midis = [60, 62, 64, 65, 67, 69, 71, 72]
+    stored = [xnote(i, midis[i], i // 4 + 1, i % 4 + 1,
+                    (i % 4), i) for i in range(8)]
+    correct = [xnote(i, midis[i], i // 4 + 1, i % 4 + 1, 0, i)
+               for i in range(8)]
+    seed_piece(pid, stored, reparsed=correct)
+    db.create_practice_score(
+        f"ps_{pid}", pid, "旧练习谱",
+        json.dumps(_legacy_practice_segments(), ensure_ascii=False), "{}")
+    return midis
+
+
+def test_legacy_practice_segments_map_via_stable_index():
+    """修复前创建的练习谱（每音一个单位）：片段经稳定 score_index 映射到
+    修订谱的正确轮次单位，继承状态不失真。"""
+    midis = _seed_legacy_practice_piece("p_psrc")
+    # 修订：m1 原样保留；m2 删除第 3 音(71)，第 4 音原位保留
+    new = [xnote(i, midis[i], i // 4 + 1, i % 4 + 1, 0, i)
+           for i in range(6)]
+    new.append(xnote(6, 72, 2, 4, 0, 7.0))
+    _set_pending_rev(new)
+    rev = rv.get_revision(
+        rv.create_revision("p_psrc", rev_xml("ps"), None)["id"])
+    assert rev["can_commit"], rev["blockers"]
+    item = next(a for a in rev["impact"]
+                if a["artifact"] == "practice_score")
+    seg1, seg2 = item["segments"]
+    # 段1：m1 四音全部保留，恰好组成新单位 (1,0) -> 可继承
+    assert seg1["status"] == "inheritable", seg1
+    assert seg1["new_units"] == [[1, 0]]
+    # 段2：含被删除谱音 -> 失效（单位消失）
+    assert seg2["status"] == "invalid"
+    assert item["status"] == "invalid"
+    print("OK legacy practice segments map via stable score_index")
+
+
+REAL_XML = (
+    '<?xml version="1.0"?><score-partwise version="3.1">'
+    '<part-list><score-part id="P1"><part-name>V</part-name></score-part>'
+    '</part-list><part id="P1">'
+    '<measure number="1"><attributes><divisions>1</divisions>'
+    '<key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4'
+    '</beat-type></time><clef><sign>G</sign><line>2</line></clef>'
+    '</attributes>'
+    + "".join(
+        f'<note><pitch><step>{s}</step><octave>{o}</octave></pitch>'
+        f'<duration>1</duration><type>quarter</type></note>'
+        for s, o in (("C", 4), ("D", 4), ("E", 4), ("F", 4)))
+    + '</measure><measure number="2">'
+    + "".join(
+        f'<note><pitch><step>{s}</step><octave>{o}</octave></pitch>'
+        f'<duration>1</duration><type>quarter</type></note>'
+        for s, o in (("G", 4), ("A", 4), ("B", 4), ("C", 5)))
+    + '</measure></part></score-partwise>')
+
+
+def test_practice_carryover_all_kept():
+    """全部保留的修订：旧练习谱（修复前单位）整体可继承，提交后一键接续
+    为新练习谱（按新正确轮次单位）。"""
+    midis = _seed_legacy_practice_piece("p_pco")
+    new = [xnote(i, midis[i], i // 4 + 1, i % 4 + 1, 0, i)
+           for i in range(8)]
+    _set_pending_rev(new)
+    rev_id = rv.create_revision("p_pco", REAL_XML.encode(), None)["id"]
+    rev = rv.get_revision(rev_id)
+    assert rev["can_commit"], rev["blockers"]
+    item = next(a for a in rev["impact"]
+                if a["artifact"] == "practice_score")
+    assert item["status"] == "inheritable", item["segments"]
+    assert [sg["new_units"] for sg in item["segments"]] == [[[1, 0]], [[2, 0]]]
+
+    committed = rv.commit_revision(rev_id)
+    new_pid = committed["new_piece_id"]
+    # 模拟新入口分析完成（两段各含一个已确认错音）
+    new_rows = db.get_score_notes(new_pid)
+    new_score = [{"index": r["idx"], "midi": r["midi"], "beat": r["beat"],
+                  "dur_q": r["dur_q"], "measure": r["measure"],
+                  "beat_in_measure": r["beat_in_measure"],
+                  "occurrence": r["occurrence"], "part": r["part"]}
+                 for r in new_rows]
+    open(os.path.join(TMP, "files", f"{new_pid}.wav"), "wb").write(b"RIFF")
+    db.save_analysis(new_pid, os.path.join(TMP, "files", f"{new_pid}.wav"),
+                     12.0, new_score, obs_rows(new_score, wrong=(0, 4)),
+                     [], [])
+    review.recompute(new_pid)
+    ctx = rv.carryover_context(new_pid)
+    assert ctx["analyzed"]
+    tpl = next(t for t in ctx["templates"] if t["kind"] == "practice_score")
+    res = rv.apply_carryover(new_pid, "practice_score", tpl["source_id"])
+    task = db.get_practice_score(res["id"])
+    assert task and task["id"] != "ps_p_pco"
+    segs = json.loads(task["segments_json"])
+    assert [(s["measure_start"], s["occurrence_start"],
+             s["measure_end"], s["occurrence_end"]) for s in segs] == \
+        [(1, 0, 1, 0), (2, 0, 2, 0)]
+    # 旧练习谱任务只读保留
+    assert db.get_practice_score("ps_p_pco") is not None
+    print("OK practice carryover with corrected occurrence units")
+
+
+def test_insert_in_repeated_measure_keeps_inheritance():
+    """反复小节内插音：轮次修正后，同轮次其余音符按移动/保留正确归位，
+    锚点继承状态不失真（不会被误判为删除/失效）。"""
+    # 旧谱：m1 四音 C D E F 反复一遍；旧库错误轮次 0..7，重解析为 0/1
+    midis = [60, 62, 64, 65]
+    stored = [xnote(i, midis[i % 4], 1, i % 4 + 1, i, i) for i in range(4)]
+    stored += [xnote(4 + i, midis[i], 1, i + 1, 4 + i, 4 + i)
+               for i in range(4)]
+    correct = [xnote(i, midis[i % 4], 1, i % 4 + 1, i // 4, i)
+               for i in range(8)]
+    seed_piece("p_ins", stored, reparsed=correct)
+    db.add_anchor("p_ins", "exclude_score", 1, None, "D-first-pass")
+
+    # 修订：m1 开头插入 G(67)，其余音符顺移一拍（两遍演奏都如此）
+    new, idx = [], 0
+    for occ in (0, 1):
+        new.append(xnote(idx, 67, 1, 1, occ, occ * 5)); idx += 1
+        for b, midi in enumerate(midis):
+            new.append(xnote(idx, midi, 1, b + 2, occ, occ * 5 + b + 1))
+            idx += 1
+    _set_pending_rev(new)
+    rev = rv.get_revision(
+        rv.create_revision("p_ins", rev_xml("ins"), None)["id"])
+    assert rev["can_commit"], rev["blockers"]
+    s = rev["summary"]
+    # 全部旧音在新谱找到同轮次同内容对应（拍位顺移 -> 移动），无删除
+    assert s["deleted"] == 0 and s["added"] == 2 and s["moved"] == 8, s
+    kinds = {m["old"]["score_index"]: m["kind"]
+             for m in rev["matches"] if m.get("old")}
+    assert set(kinds.values()) == {"moved"}
+    # 移动发生在同一反复轮次内（第 1 遍 -> 第 1 遍，第 2 遍 -> 第 2 遍）
+    for m in rev["matches"]:
+        if m["kind"] == "moved":
+            assert m["old"]["occurrence"] == m["new"]["occurrence"]
+    # 锚点：谱位为移动 -> 需复核（而非失效），继承状态不失真
+    anc = {a["kind"] + ":" + str(a.get("old_score_index")): a["status"]
+           for a in rev["impact"] if a["artifact"] == "anchor"}
+    assert anc["exclude_score:1"] == "review", anc
+    print("OK insert in repeated measure keeps inheritance truthful")
+
+
 def main():
     db.init_db()
     test_match_classification()
@@ -359,6 +633,12 @@ def main():
     test_missing_coordinate_blocks()
     test_ambiguous_move_block()
     test_polyphony_scan()
+    test_measure_occurrences_per_instance()
+    test_occurrence_corrected_via_reparse()
+    test_insert_in_repeated_measure_keeps_inheritance()
+    test_source_reparse_mismatch_blocks()
+    test_legacy_practice_segments_map_via_stable_index()
+    test_practice_carryover_all_kept()
     test_end_to_end()
     test_blocked_preview_cannot_commit()
     test_source_change_after_preview_blocks()

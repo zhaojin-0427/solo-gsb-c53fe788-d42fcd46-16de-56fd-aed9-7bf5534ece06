@@ -35,8 +35,11 @@ from app.services import revision as rv  # noqa: E402
 from app.services import review  # noqa: E402
 
 _PENDING_REV = []
+_SOURCE_PARSES = {}
 rv.score_parser.parse_musicxml = lambda path: \
-    ([dict(n) for n in _PENDING_REV], [])
+    ([dict(n) for n in _SOURCE_PARSES[path]]
+     if path in _SOURCE_PARSES
+     else [dict(n) for n in _PENDING_REV], [])
 
 
 def note(i, midi, m, b, occ=0):
@@ -80,6 +83,8 @@ def seed():
          encoding="utf-8").write(XML)
     open(os.path.join(TMP, "files", "p1.wav"), "wb").write(b"RIFF")
     db.add_anchor("p1", "exclude_score", 0, None, "x")
+    _SOURCE_PARSES[os.path.join(TMP, "files", "p1.xml")] = \
+        [dict(n) for n in old]
     review.recompute("p1")
     return old
 
@@ -327,6 +332,9 @@ def main():
     b2 = json.dumps(rep2, sort_keys=True, separators=(",", ":"))
     assert b1 == b2
     assert rep1["format"] == "score-revision-migration-report"
+    # 轮次坐标策略随报告固化（确定性常量），重解析对应可靠
+    assert rep1["source_reparse_reliable"] is True
+    assert "小节实例" in rep1["source_coordinate_policy"]
 
     # 提交幂等：重复 request_id 回放同一新入口
     st, committed = c.call("POST", f"/api/revisions/{rid}/commit",
@@ -375,6 +383,34 @@ def main():
     assert st == 200
     st, _ = c.call("GET", f"/api/revisions/{rid2}")
     assert st == 404
+
+    # 原谱重新解析与旧库无法可靠对应（音符数漂移）：预览说明原因，
+    # 确认 422（request_id 幂等回放同样 422）
+    _SOURCE_PARSES[os.path.join(TMP, "files", "p1.xml")] = \
+        [dict(n) for n in old[:4]]
+    _PENDING_REV.clear()
+    _PENDING_REV.extend(dict(n) for n in old)
+    if c._client is not None:
+        st, b3 = c.call(
+            "POST", "/api/pieces/p1/revisions",
+            files={"musicxml": ("r.xml", XML.encode(), "application/xml")})
+    else:
+        c.set_stub_file("musicxml", XML.encode())
+        st, b3 = c.call("POST", "/api/pieces/p1/revisions")
+    assert st == 200 and b3["has_blockers"] and not b3["can_commit"]
+    assert any(b["reason"] == "source_reparse_mismatch"
+               for b in b3["blockers"])
+    rid3 = b3["id"]
+    st, blocked = c.call("POST", f"/api/revisions/{rid3}/commit",
+                         {"request_id": "rm-1"})
+    assert st == 422 and blocked["reason"] == "migration_blocked"
+    assert any(b["reason"] == "source_reparse_mismatch"
+               for b in blocked["blockers"])
+    st, replay = c.call("POST", f"/api/revisions/{rid3}/commit",
+                        {"request_id": "rm-1"})
+    assert st == 422 and replay["reason"] == "migration_blocked"
+    st, _ = c.call("DELETE", f"/api/revisions/{rid3}")
+    assert st == 200
 
     print("REVISION API OK")
 
